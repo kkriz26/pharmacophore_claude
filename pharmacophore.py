@@ -1,3 +1,4 @@
+
 """
 pharmacophore.py
 ----------------
@@ -122,6 +123,26 @@ def read_xyz(path):
         if len(parts) >= 4:
             atoms.append((parts[0], float(parts[1]), float(parts[2]), float(parts[3])))
     return atoms
+
+
+def pairwise_esp_rmsd(all_surf_coords, all_esp_vals, esp_weight=10.0):
+    """
+    Compute pairwise ESP surface RMSD between all molecules.
+    esp_weight scales ESP differences relative to spatial distances (in Angstrom).
+    Returns (n_mols x n_mols) symmetric matrix.
+    """
+    from scipy.spatial import cKDTree
+    n = len(all_surf_coords)
+    matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            tree = cKDTree(all_surf_coords[j])
+            dists, idxs = tree.query(all_surf_coords[i])
+            esp_diff = all_esp_vals[i] - all_esp_vals[j][idxs]
+            rmsd = float(np.sqrt(np.mean(dists**2 + (esp_weight * esp_diff)**2)))
+            matrix[i, j] = rmsd
+            matrix[j, i] = rmsd
+    return matrix
  
  
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,9 +228,30 @@ def principal_axes_rotation(atoms):
     _, evecs = np.linalg.eigh(I)   # columns = eigenvectors, ascending eigenvalue
     R = evecs.T                     # rows = principal axes
     return ctr, R
+
+
+def kabsch_iterative(mob, ref, n_iter=10, reject_threshold=2.0):
+    weights = np.ones(len(mob))
+    for _ in range(n_iter):
+        # weighted centring
+        ctr_mob = np.average(mob, weights=weights, axis=0)
+        ctr_ref = np.average(ref, weights=weights, axis=0)
+        mob_c = mob - ctr_mob
+        ref_c = ref - ctr_ref
+        # weighted Kabsch
+        H = (mob_c * weights[:,None]).T @ ref_c
+        U, _, Vt = np.linalg.svd(H)
+        d = np.linalg.det(Vt.T @ U.T)
+        R = Vt.T @ np.diag([1,1,d]) @ U.T
+        # residuals
+        residuals = np.sqrt(np.sum((mob_c @ R.T - ref_c)**2, axis=1))
+        # downweight outliers
+        weights = np.where(residuals > reject_threshold, 0.0, 1.0)
+        if weights.sum() < 3:
+            break
+    return R, ctr_mob, ctr_ref
  
- 
-def kabsch_rotation(P, Q):
+def kabsch_rotation(P, Q): #deprecated
     """
     Find the optimal rotation R that minimises RMSD between P and Q
     (both already centred at origin).
@@ -248,15 +290,15 @@ def align_to_reference(ref_atoms_pa, mob_atoms, mob_surf_coords):
     # Step 1 – centre + rotate mobile to its own principal axes
     ctr_mob, R_pa = principal_axes_rotation(mob_atoms)
     all_coords = np.array([[a[1], a[2], a[3]] for a in mob_atoms])
-    all_pa = (all_coords - ctr_mob) @ R_pa.T
+    all_pa = np.array((all_coords - ctr_mob) @ R_pa.T)
  
     # Step 2 – Kabsch fit of PA-aligned heavy atoms onto reference heavy atoms
     mob_heavy_pa = (heavy_coords(mob_atoms) - ctr_mob) @ R_pa.T
     n = min(len(ref_atoms_pa), len(mob_heavy_pa))
-    R_kab = kabsch_rotation(mob_heavy_pa[:n], ref_atoms_pa[:n])
+    R_kab, ctr_mob, ctr_ref = kabsch_iterative(mob_heavy_pa[:n], ref_atoms_pa[:n])
  
     # Step 3 – apply combined rotation to all atoms and surface
-    atoms_aligned = all_pa @ R_kab.T
+    atoms_aligned = np.array(all_pa @ R_kab.T)
     surf_aligned  = (mob_surf_coords - ctr_mob) @ R_pa.T @ R_kab.T
  
     # RMSD on the fitted heavy atoms
@@ -264,13 +306,35 @@ def align_to_reference(ref_atoms_pa, mob_atoms, mob_surf_coords):
     rmsd = float(np.sqrt(np.mean(np.sum(diff**2, axis=1))))
  
     return atoms_aligned, surf_aligned, rmsd
+
+
+def cluster_molecules(rmsd_matrix, stems, threshold=None):
+    from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
+    from scipy.spatial.distance import squareform
+    
+    linkage_matrix = linkage(squareform(rmsd_matrix), method='average')
+    
+    if threshold is None:
+        # automatic threshold: largest gap in linkage distances
+        gaps = np.diff(linkage_matrix[:, 2])
+        threshold = linkage_matrix[np.argmax(gaps), 2]
+        print(f"\nAuto threshold: {threshold:.4f}")
+    
+    labels = fcluster(linkage_matrix, threshold, criterion='distance')
+    
+    print("\nClusters:")
+    for cluster_id in sorted(set(labels)):
+        members = [stems[i] for i, l in enumerate(labels) if l == cluster_id]
+        print(f"  Cluster {cluster_id}: {members}")
+    
+    return labels, linkage_matrix
  
  
 # ─────────────────────────────────────────────────────────────────────────────
 # COARSE GRID + PHARMACOPHORE
 # ─────────────────────────────────────────────────────────────────────────────
  
-def build_pharmacophore(all_surf_coords, all_esp_vals,
+def build_pharmacophore(all_surf_coords, all_esp_vals, all_act,
                         grid_spacing=1.0,
                         esp_pos=0.02, esp_neg=-0.02, esp_var=0.01):
     """
@@ -299,41 +363,39 @@ def build_pharmacophore(all_surf_coords, all_esp_vals,
     cell_keys = [tuple(row) for row in cell_idx]
  
     # accumulate ESP values per cell
-    cell_data = defaultdict(list)
-    for key, esp in zip(cell_keys, all_esp):
-        cell_data[key].append(esp)
+    mol_ids = np.concatenate([
+    np.full(len(c), i) for i, c in enumerate(all_surf_coords)
+    ])
+
+    cell_data = defaultdict(lambda: defaultdict(list))
+    for key, esp, mol_id in zip(cell_keys, all_esp, mol_ids):
+        cell_data[key][mol_id].append(esp)
  
     # also track how many distinct molecules contributed
     # build molecule-id array (which molecule each point came from)
-    mol_ids = np.concatenate([
-        np.full(len(c), i) for i, c in enumerate(all_surf_coords)
-    ])
-    cell_mols = defaultdict(set)
-    for key, mol_id in zip(cell_keys, mol_ids):
-        cell_mols[key].add(mol_id)
  
     pharmacophore = []
-    for key, esp_list in cell_data.items():
-        esp_arr  = np.array(esp_list)
-        mean_esp = float(np.mean(esp_arr))
-        std_esp  = float(np.std(esp_arr)) if len(esp_arr) > 1 else 0.0
-        n_mols   = len(cell_mols[key])
- 
-        # cell centre in Angstrom
+
+    for key, mol_dict in cell_data.items():
+        mol_means = np.array([np.mean(v) for v in mol_dict.values()])
+        weights = np.array([all_act[mid] for mid in mol_dict.keys()])
+        weights_norm = weights / weights.sum()
         cx = (key[0] + 0.5) * grid_spacing
         cy = (key[1] + 0.5) * grid_spacing
         cz = (key[2] + 0.5) * grid_spacing
- 
-        # colour assignment (priority: variability > ESP sign)
+        mean_esp = float(np.average(mol_means, weights=weights_norm))
+        std_esp  = float(np.sqrt(np.average((mol_means - mean_esp)**2, weights=weights_norm))) if len(mol_means) > 1 else 0.0
+        n_mols   = len(mol_dict)
+        coverage = weights.sum() / sum(all_act)
+        radius_modifier = coverage * (1.0 - 0.7 * min(std_esp / esp_var, 1.0))
+        
 
         if mean_esp > 0:
-            t = min(mean_esp / esp_pos, 1.0)
-            colour = (1.0, 1.0 - t, 1.0 - t)   # white → red
+            t = min(mean_esp / esp_pos, 1.0)*coverage
+            colour =  (1.0 - t, 1.0 - t, 1.0)   # white → blue
         else:
-            t = min(abs(mean_esp) / abs(esp_neg), 1.0)
-            colour = (1.0 - t, 1.0 - t, 1.0)   # white → blue
-        radius_modifier = (1.0 - 0.7 * min(std_esp / esp_var, 1.0))
-
+            t = min(abs(mean_esp) / abs(esp_neg), 1.0)*coverage
+            colour = (1.0, 1.0 - t, 1.0 - t)   # white → red
 
  
         pharmacophore.append((cx, cy, cz, mean_esp, std_esp, n_mols, colour, radius_modifier))
@@ -397,8 +459,20 @@ def discover_molecules(directory):
     if not stems:
         sys.exit(f"[error] No complete molecule sets found in '{directory}'.\n"
                  f"  Expected: <name>.xyz + <name>.dens.cube + <name>.pote.cube")
- 
-    return [(s, xyz_files[s], dens_files[s], pote_files[s]) for s in stems]
+
+    activities = {}
+    act_path = d / 'activities.txt'
+    if act_path.exists():
+        with open(act_path) as acts:
+            for line in acts:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] in stems:
+                    activities[parts[0]] = float(parts[1])
+    else:
+        print("[warn] no activities.txt found, all weights set to 1.0")
+        activities = {s: 1.0 for s in stems}
+    
+    return [(s, xyz_files[s], dens_files[s], pote_files[s], activities[s]) for s in stems]
  
  
 def run(args):
@@ -410,7 +484,7 @@ def run(args):
     outdir.mkdir(parents=True, exist_ok=True)
  
     # ── 1. Reference molecule ────────────────────────────────────────────────
-    ref_stem, ref_xyz, ref_dens, ref_pote = molecules[0]
+    ref_stem, ref_xyz, ref_dens, ref_pote, ref_act = molecules[0]
     print(f"\n[1/3] Processing reference: {ref_stem}")
  
     ref_atoms_raw = read_xyz(ref_xyz)
@@ -430,11 +504,13 @@ def run(args):
  
     all_surf_coords = [ref_surf_pa]
     all_esp_vals    = [ref_esp]
+    all_act = [ref_act]
+
  
     # ── 2. Mobile molecules ──────────────────────────────────────────────────
     print(f"\n[2/3] Aligning {len(molecules)-1} mobile molecule(s) ...")
  
-    for stem, xyz_path, dens_path, pote_path in molecules[1:]:
+    for stem, xyz_path, dens_path, pote_path, act in molecules[1:]:
         print(f"  {stem}")
         mob_atoms = read_xyz(xyz_path)
         mob_surf, mob_esp = extract_isosurface(dens_path, pote_path, args.isovalue)
@@ -447,12 +523,26 @@ def run(args):
  
         all_surf_coords.append(surf_al)
         all_esp_vals.append(mob_esp)
+        all_act.append(act)
+
+    ESP_RMSE_matrix = pairwise_esp_rmsd(all_surf_coords, all_esp_vals)
+    stems = [m[0] for m in molecules]
+    #print("\nPairwise ESP surface RMSD matrix:")#printing matrix of ESP RMSEs
+    #print(f"{'':15s}" + "".join(f"{s:15s}" for s in stems))
+    #for i, row in enumerate(ESP_RMSE_matrix):
+    #    print(f"{stems[i]:15s}" + "".join(f"{v:15.4f}" for v in row))
  
+    cluster_labels, linkage_matrix = cluster_molecules(ESP_RMSE_matrix, stems)
+
+    
+
+
     # ── 3. Pharmacophore ─────────────────────────────────────────────────────
     print(f"\n[3/3] Building pharmacophore grid (spacing={args.grid} Angstrom) ...")
  
     pharmacophore = build_pharmacophore(
         all_surf_coords, all_esp_vals,
+        all_act,
         grid_spacing = args.grid,
         esp_pos      = args.esp_pos,
         esp_neg      = args.esp_neg,
@@ -477,6 +567,7 @@ def parse_args():
         description='ESP-based pharmacophore from density/potential cube files.')
     p.add_argument('--directory', type=str,
                    help='Directory containing *.xyz, *.dens.cube, *.pote.cube files', default='.')
+    p.add_argument('--esp_cluster_threshold', type=float, default=None)
     p.add_argument('--isovalue', type=float, default=0.001,
                    help='Electron density isovalue (default: 0.001 a.u.)')
     p.add_argument('--grid',     type=float, default=1.0,
@@ -491,6 +582,9 @@ def parse_args():
                    help='Output directory (default: <directory>/pharmacophore_out)')
     return p.parse_args()
  
+ 
+if __name__ == '__main__':
+    run(parse_args())
  
 if __name__ == '__main__':
     run(parse_args())
