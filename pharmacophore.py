@@ -1,4 +1,3 @@
-
 """
 pharmacophore.py
 ----------------
@@ -11,20 +10,9 @@ Pipeline:
   5. Average ESP per cell; flag high-variability cells (std > threshold)
   6. Write aligned *.xyz files and a PyMOL CGO pharmacophore script
  
-Usage:
-    python pharmacophore.py <directory>
-                            [--isovalue   0.001]
-                            [--grid       1.0  ]
-                            [--esp_pos    0.02 ]
-                            [--esp_neg   -0.02 ]
-                            [--esp_var    0.01 ]
-                            [--outdir     <dir> ]
+have a folder with activities.txt that have two columns a name and a number (activity, either inhibition or activation).
+ have and xyz file and corresponding density and potential cube files (from gaussian for instance)
  
-Colour convention (CGO spheres):
-    red    ESP mean >  esp_pos             (positive / electron-poor)
-    blue   ESP mean <  esp_neg             (negative / electron-rich)
-    green  |ESP mean| <= |threshold|       (hydrophobic / neutral)
-    purple std(ESP)   >  esp_var           (high variability across molecules)
 """
  
 import sys
@@ -316,6 +304,9 @@ def cluster_molecules(rmsd_matrix, stems, threshold=None):
     
     if threshold is None:
         # automatic threshold: largest gap in linkage distances
+        if len(stems) < 3:
+            print("\nOnly 2 molecules, no clustering needed")
+            return np.array([1, 2]), linkage_matrix
         gaps = np.diff(linkage_matrix[:, 2])
         threshold = linkage_matrix[np.argmax(gaps), 2]
         print(f"\nAuto threshold: {threshold:.4f}")
@@ -397,9 +388,12 @@ def build_pharmacophore(all_surf_coords, all_esp_vals, all_act,
             t = min(abs(mean_esp) / abs(esp_neg), 1.0)*coverage
             colour = (1.0, 1.0 - t, 1.0 - t)   # white → red
 
+
  
         pharmacophore.append((cx, cy, cz, mean_esp, std_esp, n_mols, colour, radius_modifier))
- 
+    t_vals = [mean_esp / (abs(esp_pos) if mean_esp > 0 else abs(esp_neg)) * coverage 
+              for _, _, _, mean_esp, *_ in pharmacophore]
+    print(f"    t range: [{min(t_vals):.4f}, {max(t_vals):.4f}]")
     return pharmacophore
  
  
@@ -463,6 +457,7 @@ def discover_molecules(directory):
     activities = {}
     act_path = d / 'activities.txt'
     if act_path.exists():
+        print('I have found an activity file')
         with open(act_path) as acts:
             for line in acts:
                 parts = line.split()
@@ -582,9 +577,6 @@ def parse_args():
                    help='Output directory (default: <directory>/pharmacophore_out)')
     return p.parse_args()
  
- 
-if __name__ == '__main__':
-    run(parse_args())
  
 if __name__ == '__main__':
     run(parse_args())
