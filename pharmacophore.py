@@ -1,3 +1,4 @@
+
 """
 pharmacophore.py
 ----------------
@@ -382,16 +383,16 @@ def build_pharmacophore(all_surf_coords, all_esp_vals, all_act,
         
 
         if mean_esp > 0:
-            t = min(mean_esp / esp_pos, 1.0)*coverage
+            t = min(mean_esp / esp_pos, 1.0) #*coverage
             colour =  (1.0 - t, 1.0 - t, 1.0)   # white → blue
         else:
-            t = min(abs(mean_esp) / abs(esp_neg), 1.0)*coverage
+            t = min(abs(mean_esp) / abs(esp_neg), 1.0) #*coverage
             colour = (1.0, 1.0 - t, 1.0 - t)   # white → red
 
 
  
         pharmacophore.append((cx, cy, cz, mean_esp, std_esp, n_mols, colour, radius_modifier))
-    t_vals = [mean_esp / (abs(esp_pos) if mean_esp > 0 else abs(esp_neg)) * coverage 
+    t_vals = [mean_esp / (abs(esp_pos) if mean_esp > 0 else abs(esp_neg))# * coverage 
               for _, _, _, mean_esp, *_ in pharmacophore]
     print(f"    t range: [{min(t_vals):.4f}, {max(t_vals):.4f}]")
     return pharmacophore
